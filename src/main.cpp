@@ -40,9 +40,10 @@
 #include <tf2/LinearMath/Transform.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <vectornav/Ins.h>
+#include <vectornav/TimeGroup.h>
 
 
-ros::Publisher pubIMU, pubMag, pubGPS, pubOdom, pubTemp, pubPres, pubIns;
+ros::Publisher pubIMU, pubMag, pubGPS, pubOdom, pubTemp, pubPres, pubIns, pubTime,pubPoseECEF;
 ros::ServiceServer resetOdomSrv;
 
 XmlRpc::XmlRpcValue rpc_temp;
@@ -60,6 +61,13 @@ using namespace vn::xplat;
 
 // Method declarations for future use.
 void BinaryAsyncMessageReceived(void* userData, Packet& p, size_t index);
+static inline vectornav::TimeUTC toMsg(const vn::protocol::uart::TimeUtc &rhs);
+static inline vectornav::TimeStatus toMsg(const uint8_t rhs);
+static inline geometry_msgs::Point toMsg(const vn::math::vec3d &rhs);
+
+
+ inline static double deg2rad(double in) { return in * M_PI / 180.0; }
+
 
 // Custom user data to pass to packet callback function
 struct UserData {
@@ -123,6 +131,8 @@ int main(int argc, char *argv[])
     pubTemp = n.advertise<sensor_msgs::Temperature>("vectornav/Temp", 1000);
     pubPres = n.advertise<sensor_msgs::FluidPressure>("vectornav/Pres", 1000);
     pubIns = n.advertise<vectornav::Ins>("vectornav/INS", 1000);
+    pubTime = n.advertise<vectornav::TimeGroup>("vectornav/TimeGroup", 1000);
+    pubPoseECEF = n.advertise<geometry_msgs::PoseWithCovarianceStamped>("vectornav/pose", 1000);
 
     resetOdomSrv = n.advertiseService<std_srvs::Empty::Request, std_srvs::Empty::Response>(
         "reset_odom", boost::bind(&resetOdom, _1, _2, &user_data)) ;
@@ -135,6 +145,8 @@ int main(int argc, char *argv[])
     // Sensor IMURATE (800Hz by default, used to configure device)
     int SensorImuRate;
 
+    int sync_out_mode;
+
     // Load all params
     pn.param<std::string>("map_frame_id", user_data.map_frame_id, "map");
     pn.param<std::string>("frame_id", user_data.frame_id, "vectornav");
@@ -144,6 +156,8 @@ int main(int argc, char *argv[])
     pn.param<std::string>("serial_port", SensorPort, "/dev/ttyUSB0");
     pn.param<int>("serial_baud", SensorBaudrate, 115200);
     pn.param<int>("fixed_imu_rate", SensorImuRate, 800);
+
+    pn.param<int>("sync_out_mode", sync_out_mode, 1);
 
     //Call to set covariances
     if(pn.getParam("linear_accel_covariance",rpc_temp))
@@ -249,7 +263,7 @@ int main(int argc, char *argv[])
             TIMEGROUP_NONE
             | TIMEGROUP_GPSTOW
             | TIMEGROUP_GPSWEEK
-            | TIMEGROUP_TIMEUTC,
+            | TIMEGROUP_SYNCOUTCNT,
             IMUGROUP_NONE,
             GPSGROUP_NONE,
             ATTITUDEGROUP_YPRU, //<-- returning yaw pitch roll uncertainties
@@ -264,6 +278,12 @@ int main(int argc, char *argv[])
             GPSGROUP_NONE);
 
     vs.writeBinaryOutput1(bor);
+
+    // Sync control
+    // 5.2.9
+    vn::sensors::SynchronizationControlRegister configSync;
+    configSync.syncOutMode = (vn::protocol::uart::SyncOutMode)sync_out_mode;
+    vs.writeSynchronizationControl(configSync);    
 
     // Register async callback function
     vs.registerAsyncPacketReceivedHandler(&user_data, BinaryAsyncMessageReceived);
@@ -678,6 +698,96 @@ void fill_ins_message(
     }
 }
 
+//Helper function to create timegroup message
+void fill_timegroup_message(
+    vectornav::TimeGroup &msgTime, vn::sensors::CompositeData &cd, ros::Time &time, UserData *user_data)
+{
+    msgTime.header.stamp = time;
+    msgTime.header.frame_id = user_data->frame_id;
+
+    if (cd.hasTimeStartup()) {
+      msgTime.timestartup = cd.timeStartup();
+    }
+
+    if (cd.hasTimeGps()) {
+      msgTime.timegps = cd.timeGps();
+    }
+
+    if (cd.hasGpsTow()) {
+      msgTime.gpstow = cd.gpsTow();
+    }
+
+    if (cd.hasWeek()) {
+      msgTime.gpsweek = cd.week();
+    }
+
+    if (cd.hasTimeSyncIn()) {
+      msgTime.timesyncin = cd.timeSyncIn();
+    }
+
+    if (cd.hasTimeGpsPps()) {
+      msgTime.timegpspps = cd.timeGpsPps();
+    }
+
+    if (cd.hasTimeUtc()) {
+      msgTime.timeutc = toMsg(cd.timeUtc());
+    }
+
+    if (cd.hasSyncInCnt()) {
+      msgTime.syncincnt = cd.syncInCnt();
+    }
+
+    if (cd.hasSyncOutCnt()) {
+      msgTime.syncoutcnt = cd.syncOutCnt();
+    }
+
+    if (cd.hasTimeStatus()) {
+      msgTime.timestatus = toMsg(cd.hasTimeStatus());
+    }    
+}
+
+//Helper function to create ECEF Pose message
+void fill_pose_message(
+    geometry_msgs::PoseWithCovarianceStamped &msgPose, vn::sensors::CompositeData &cd, ros::Time &time, UserData *user_data)
+{
+    msgPose.header.stamp = time;
+    msgPose.header.frame_id = "earth";
+
+    if (cd.hasPositionEstimatedEcef()) {
+      msgPose.pose.pose.position = toMsg(cd.positionEstimatedEcef());
+    }    
+    // Converts Quaternion in NED to ECEF
+    tf2::Quaternion q, q_enu2ecef, q_ned2enu;
+    q_ned2enu.setRPY(M_PI, 0.0, M_PI / 2);
+
+    auto latitude = deg2rad(msgPose.pose.pose.position.x);
+    auto longitude = deg2rad(msgPose.pose.pose.position.y);
+    q_enu2ecef.setRPY(0.0, latitude, longitude);
+
+    if (cd.hasQuaternion()) {
+        auto q_in_cd = cd.quaternion();
+        q = tf2::Quaternion(q_in_cd[0],q_in_cd[1],q_in_cd[2],q_in_cd[3]);
+        // q.x = q_in_cd[0];
+        // q.y = q_in_cd[1];
+        // q.z = q_in_cd[2];
+        // q.w = q_in_cd[3];
+    }
+
+    // fromMsg(msg_in->quaternion, q);
+
+    // Rotation from body frame to ECEF
+    msgPose.pose.pose.orientation = toMsg(q_enu2ecef *q_ned2enu * q);
+
+    /// TODO(Dereck): Pose Covariance
+    //  9x9 we could: 
+    //  - populate UL 3x3 diag with gps_posu_ (as ENU)
+    //  - populate continuing 3x3 diag with YPR uncertainty from the attitudeGroup
+    //  valid?
+ 
+}
+
+
+
 //
 // Callback function to process data packet from sensor
 //
@@ -744,4 +854,52 @@ void BinaryAsyncMessageReceived(void* userData, Packet& p, size_t index)
         fill_ins_message(msgINS, cd, time, user_data);
         pubIns.publish(msgINS);
     }
+
+    //Time
+    if (pubTime.getNumSubscribers() > 0)
+    {
+        vectornav::TimeGroup msgTime;
+        fill_timegroup_message(msgTime, cd, time, user_data);
+        pubTime.publish(msgTime);
+    }    
+
+    //ECEF Pose
+    if (pubPoseECEF.getNumSubscribers() > 0)
+    {
+        geometry_msgs::PoseWithCovarianceStamped msgPose;
+        fill_pose_message(msgPose, cd, time, user_data);
+        pubPoseECEF.publish(msgPose);
+    }      
+
+}
+
+/// Convert from vn::protocol::uart::TimeUTC to vectornav_msgs::msg::TimeUTC
+static inline vectornav::TimeUTC toMsg(const vn::protocol::uart::TimeUtc &rhs) {
+    vectornav::TimeUTC lhs;
+    lhs.year = rhs.year;
+    lhs.month = rhs.month;
+    lhs.day = rhs.day;
+    lhs.hour = rhs.hour;
+    lhs.min = rhs.min;
+    lhs.sec = rhs.sec;
+    lhs.ms = rhs.ms;
+    return lhs;
+}
+
+/// Convert from vn::math::mat3f to vectornav_msgs::msg::TimeStatus
+static inline vectornav::TimeStatus toMsg(const uint8_t rhs) {
+vectornav::TimeStatus lhs;
+lhs.time_ok = rhs & 0x01;
+lhs.date_ok = rhs & 0x02;
+lhs.utctime_ok = rhs & 0x04;
+return lhs;
+}
+
+/// Convert from vn::math::vec3d to geometry_msgs::msgs::Point
+static inline geometry_msgs::Point toMsg(const vn::math::vec3d &rhs) {
+geometry_msgs::Point lhs;
+lhs.x = rhs[0];
+lhs.y = rhs[1];
+lhs.z = rhs[2];
+return lhs;
 }

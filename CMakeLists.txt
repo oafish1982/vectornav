@@ -15,6 +15,9 @@ find_package(catkin REQUIRED COMPONENTS
 add_message_files(
     FILES
     Ins.msg
+    TimeGroup.msg
+    TimeStatus.msg
+    TimeUTC.msg
 )
 
 generate_messages(
